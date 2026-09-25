@@ -23,6 +23,17 @@ python3 app.py --db organ_allocation.db
 - `POST /api/allocations/{id}/implant`：确认植入。
 - `GET /api/allocations/{id}/audit`、`GET /api/state`：完整审计和权限视图。
 
+## 配对链（跨医院成组交换）
+
+协调员一次提交 2-4 组器官与患者。建链前先逐组校验血型、器官、医院与有效期（且确认截止时间不得晚于任何器官有效期），全部对得上才建立待确认链，任一组不合格则整链不建、不锁任何器官。建链后各组器官进入 `chain_pending`，接收医院在约定确认时间前逐组确认；任一组拒绝或超时，该环节留在链上（器官保持锁定），其余环节的未过期器官恢复可选（已过期则记为 `expired`）。全部确认后链转为 `confirmed`，器官转为 `allocated`。每次确认、退回、超时和器官恢复都写入链事件，审计员可逐条追溯。
+
+- `POST /api/chains`：协调员建链，body 为 `{"legs": [{"donor_id", "candidate_id"}, ...], "confirm_deadline": "ISO 时间"}`；校验失败返回 409 及 `details.issues` 分组明细。
+- `POST /api/chains/{id}/legs/{seq}/confirm`、`reject`：接收医院确认或退回（`reason` 必填）。
+- `GET /api/chains/{id}`：链路顺序、各方状态与截止时间；医院仅可见与本机构相关的链，其他组患者姓名脱敏。
+- `GET /api/chains/{id}/audit`：审计员查看链事件（含每次退回）。
+
+代码按职责分开维护：配对判断在 `chain_matching.py`（纯函数），链记录在 `chain_store.py`（chains / chain_legs / chain_events 三表），协调台编排与页面在 `app.py` 和 `static/index.html`。
+
 ## 测试
 
 ```bash

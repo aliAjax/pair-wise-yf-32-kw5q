@@ -1,3 +1,82 @@
 <!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>器官分配协调台</title>
-<style>body{font:15px system-ui;max-width:1080px;margin:40px auto;background:#f5f7fb;padding:0 20px;color:#172033}section{background:white;padding:20px;border-radius:12px;box-shadow:0 2px 12px #0001}pre{background:#0f172a;color:#86efac;padding:16px;overflow:auto;border-radius:8px}input,button{font:inherit;padding:8px;margin:4px}button{background:#be123c;color:white;border:0;border-radius:6px}</style>
-<h1>器官分配协调台</h1><p>查看当前可用器官、候选患者和分配进度。写操作通过 JSON API 完成，医院接口需携带 X-Hospital。</p><section><input id="u" value="allocator"><input id="r" value="allocation_officer"><button onclick="load()">刷新</button><pre id="o"></pre></section><script>async function load(){let r=await fetch('/api/state',{headers:{'X-User-Id':u.value,'X-Role':r.value}});o.textContent=JSON.stringify(await r.json(),null,2)}load()</script>
+<style>
+body{font:15px system-ui;max-width:1080px;margin:40px auto;background:#f5f7fb;padding:0 20px;color:#172033}
+section{background:white;padding:20px;border-radius:12px;box-shadow:0 2px 12px #0001;margin-bottom:16px}
+pre{background:#0f172a;color:#86efac;padding:16px;overflow:auto;border-radius:8px}
+input,button,select,textarea{font:inherit;padding:8px;margin:4px}
+button{background:#be123c;color:white;border:0;border-radius:6px;cursor:pointer}
+table{border-collapse:collapse;width:100%;margin:8px 0}
+th,td{border:1px solid #e2e8f0;padding:6px 10px;text-align:left}
+th{background:#f1f5f9}
+.st-pending{color:#b45309}.st-ok{color:#15803d}.st-bad{color:#b91c1c}.st-off{color:#64748b}
+</style>
+<h1>器官分配协调台</h1>
+<section>
+  <b>身份</b>
+  <input id="u" value="coord" title="X-User-Id">
+  <select id="r"><option>coordinator</option><option>allocation_officer</option><option>hospital</option><option>auditor</option><option>viewer</option></select>
+  <input id="hosp" placeholder="X-Hospital（医院角色必填）">
+  <button onclick="loadAll()">刷新</button>
+</section>
+<section>
+  <h2>配对链</h2>
+  <div id="chainsEl"></div>
+</section>
+<section>
+  <h2>提交配对链（协调员，2-4 组）</h2>
+  <div><textarea id="legsIn" rows="3" style="width:95%">[{"donor_id":1,"candidate_id":2},{"donor_id":3,"candidate_id":4}]</textarea></div>
+  <label>确认截止时间 <input id="deadlineIn" type="datetime-local"></label>
+  <button onclick="createChain()">建立待确认链</button>
+  <pre id="createOut"></pre>
+</section>
+<section>
+  <h2>链审计（审计员）</h2>
+  <input id="auditId" type="number" min="1" placeholder="链 ID"><button onclick="loadAudit()">查询每次退回记录</button>
+  <pre id="auditOut"></pre>
+</section>
+<section>
+  <h2>状态总览</h2>
+  <pre id="o"></pre>
+</section>
+<script>
+const LEG_STATUS={pending:'待确认',confirmed:'已确认',rejected:'已退回',timed_out:'已超时',released:'已释放'};
+const CHAIN_STATUS={pending:'待确认',confirmed:'全部确认',broken:'已中断',timed_out:'已超时'};
+const $=id=>document.getElementById(id);
+function hdr(){let h={'X-User-Id':$('u').value,'X-Role':$('r').value,'Content-Type':'application/json'};if($('hosp').value)h['X-Hospital']=$('hosp').value;return h}
+function cls(s){return s==='pending'?'st-pending':(s==='confirmed'?'st-ok':(s==='rejected'||s==='timed_out'||s==='broken'?'st-bad':'st-off'))}
+async function loadAll(){
+  let res=await fetch('/api/state',{headers:hdr()});let s=await res.json();
+  $('o').textContent=JSON.stringify(s,null,2);renderChains(s.chains||[]);
+}
+function renderChains(list){
+  $('chainsEl').innerHTML=list.map(c=>{
+    let rows=c.legs.map(l=>{
+      let canAct=$('r').value==='hospital'&&c.status==='pending'&&l.status==='pending'&&l.to_hospital===$('hosp').value;
+      let ops=canAct?`<button onclick="act(${c.id},${l.seq},'confirm')">确认</button><button onclick="act(${c.id},${l.seq},'reject')">退回</button>`:'';
+      return `<tr><td>${l.seq}</td><td>${l.from_hospital} → ${l.to_hospital}</td><td>${l.organ}</td><td>${l.patient_name}</td>`+
+        `<td class="${cls(l.status)}">${LEG_STATUS[l.status]||l.status}</td><td>${l.responded_by||''} ${l.responded_at||''}</td><td>${l.reason||''}</td><td>${ops}</td></tr>`;
+    }).join('');
+    return `<h3>链 #${c.id} — <span class="${cls(c.status)}">${CHAIN_STATUS[c.status]||c.status}</span>（确认截止 ${c.confirm_deadline}）</h3>`+
+      `<table><tr><th>顺序</th><th>供体医院 → 接收医院</th><th>器官</th><th>患者</th><th>状态</th><th>回应</th><th>退回原因</th><th>操作</th></tr>${rows}</table>`;
+  }).join('')||'<p>暂无配对链</p>';
+}
+async function act(cid,seq,action){
+  let body={};
+  if(action==='reject'){let reason=prompt('退回原因');if(!reason)return;body={reason};}
+  let res=await fetch(`/api/chains/${cid}/legs/${seq}/${action}`,{method:'POST',headers:hdr(),body:JSON.stringify(body)});
+  let j=await res.json();if(!res.ok)alert(j.message);loadAll();
+}
+async function createChain(){
+  let payload;
+  try{payload={legs:JSON.parse($('legsIn').value),confirm_deadline:new Date($('deadlineIn').value).toISOString()};}
+  catch(e){$('createOut').textContent='输入格式错误: '+e;return;}
+  let res=await fetch('/api/chains',{method:'POST',headers:hdr(),body:JSON.stringify(payload)});
+  $('createOut').textContent=JSON.stringify(await res.json(),null,2);loadAll();
+}
+async function loadAudit(){
+  let res=await fetch(`/api/chains/${$('auditId').value}/audit`,{headers:hdr()});
+  $('auditOut').textContent=JSON.stringify(await res.json(),null,2);
+}
+$('deadlineIn').value=new Date(Date.now()+6*3600*1000).toISOString().slice(0,16);
+loadAll();
+</script>
