@@ -11,16 +11,21 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
+
+from chain_matching import ChainValidationError, MAX_GROUPS, MIN_GROUPS, validate_legs
+from chain_store import ChainStore
 
 PORT = 8203
 ROLES = {"viewer", "hospital", "coordinator", "allocation_officer", "auditor"}
 STATUSES = {"proposed", "accepted", "in_transit", "handed_off", "implanted", "withdrawn", "expired"}
+# available 可选；allocated 单笔分配中；locked 配对链待确认；held 断链环节留存；expired 失效；used 已植入
+DONOR_STATUSES = {"available", "allocated", "locked", "held", "expired", "used"}
 
 
 class ApiError(Exception):
-    def __init__(self, status: int, code: str, message: str):
-        super().__init__(message); self.status, self.code, self.message = status, code, message
+    def __init__(self, status: int, code: str, message: str, errors: dict[str, Any] | None = None):
+        super().__init__(message); self.status, self.code, self.message, self.errors = status, code, message, errors
 
 
 def utcnow() -> datetime: return datetime.now(timezone.utc)
@@ -70,10 +75,14 @@ class Repository:
             UNIQUE(allocation_id)
         );
         CREATE TABLE IF NOT EXISTS audit_log(
-            id INTEGER PRIMARY KEY AUTOINCREMENT, allocation_id INTEGER, donor_id INTEGER, actor TEXT NOT NULL, role TEXT NOT NULL,
+            id INTEGER PRIMARY KEY AUTOINCREMENT, allocation_id INTEGER, donor_id INTEGER, chain_id INTEGER, actor TEXT NOT NULL, role TEXT NOT NULL,
             action TEXT NOT NULL, detail_json TEXT NOT NULL, created_at TEXT NOT NULL
         );
         """)
+        # 既有数据库补齐配对链审计列
+        cols = {row["name"] for row in self.conn.execute("PRAGMA table_info(audit_log)")}
+        if "chain_id" not in cols:
+            self.conn.execute("ALTER TABLE audit_log ADD COLUMN chain_id INTEGER")
 
     @contextmanager
     def tx(self):
@@ -84,13 +93,15 @@ class Repository:
             self.conn.execute("ROLLBACK"); raise
 
     @staticmethod
-    def audit(conn: sqlite3.Connection, allocation_id: int | None, donor_id: int | None, actor: str, role: str, action: str, detail: dict[str, Any]) -> None:
-        conn.execute("INSERT INTO audit_log(allocation_id,donor_id,actor,role,action,detail_json,created_at) VALUES(?,?,?,?,?,?,?)",
-                     (allocation_id, donor_id, actor, role, action, json.dumps(detail, ensure_ascii=False, sort_keys=True), iso()))
+    def audit(conn: sqlite3.Connection, allocation_id: int | None, donor_id: int | None, actor: str, role: str, action: str, detail: dict[str, Any], chain_id: int | None = None) -> None:
+        conn.execute("INSERT INTO audit_log(allocation_id,donor_id,chain_id,actor,role,action,detail_json,created_at) VALUES(?,?,?,?,?,?,?,?)",
+                     (allocation_id, donor_id, chain_id, actor, role, action, json.dumps(detail, ensure_ascii=False, sort_keys=True), iso()))
 
 
 class OrganAllocationService:
-    def __init__(self, path: str | Path): self.repo = Repository(path)
+    def __init__(self, path: str | Path):
+        self.repo = Repository(path)
+        self.chains = ChainStore(self.repo.conn)
 
     @staticmethod
     def identity(headers: Any) -> tuple[str, str, str]:
@@ -298,6 +309,233 @@ class OrganAllocationService:
             Repository.audit(conn, allocation_id, row["donor_id"], actor, role, "allocation_withdrawn", {"reason": reason})
             return self._allocation(conn, allocation_id, role, hospital)
 
+    # ------------------------------------------------------------------
+    # 跨医院成组交换配对链（配对判断在 chain_matching，链记录在 chain_store）
+    # ------------------------------------------------------------------
+
+    LEG_REQUIRED = ("donor_id", "candidate_id")
+
+    def _load_chain(self, conn: sqlite3.Connection, chain_id: int) -> sqlite3.Row:
+        chain = self.chains.get_chain_tx(conn, chain_id)
+        if not chain: raise ApiError(404, "chain_not_found", "配对链不存在")
+        return chain
+
+    @staticmethod
+    def _chain_mask(leg: dict[str, Any], role: str, hospital: str) -> None:
+        # 与单笔分配一致：非患者所在医院只看到掩码
+        if role == "hospital" and hospital != leg["candidate_hospital"]:
+            leg["patient_name"] = "***"
+
+    def _chain_view(self, conn: sqlite3.Connection, chain: sqlite3.Row, role: str, hospital: str) -> dict[str, Any]:
+        result = dict(chain)
+        legs = [dict(row) for row in self.chains.legs_tx(conn, chain["id"])]
+        for leg in legs:
+            self._chain_mask(leg, role, hospital)
+            leg["released_to_available"] = chain["status"] == "broken" and leg["status"] in {"pending", "confirmed"} and leg["donor_status"] == "available"
+        result["legs"] = legs
+        return result
+
+    def create_chain(self, actor: str, role: str, body: dict[str, Any]) -> dict[str, Any]:
+        if role != "coordinator": raise ApiError(403, "chain_forbidden", "只有协调员可以提交配对链")
+        raw_groups = body.get("groups")
+        if not isinstance(raw_groups, list) or not MIN_GROUPS <= len(raw_groups) <= MAX_GROUPS:
+            raise ApiError(400, "invalid_groups", f"一次必须提交 {MIN_GROUPS}-{MAX_GROUPS} 组器官和患者")
+        groups: list[tuple[int, int]] = []
+        for index, group in enumerate(raw_groups):
+            if not isinstance(group, dict) or not all(isinstance(group.get(k), int) for k in self.LEG_REQUIRED):
+                raise ApiError(400, "invalid_groups", f"第 {index + 1} 组必须包含整数 donor_id 和 candidate_id")
+            groups.append((group["donor_id"], group["candidate_id"]))
+        deadline = parse_time(body.get("deadline"))
+        if deadline <= utcnow(): raise ApiError(400, "invalid_deadline", "确认截止时间必须晚于当前时间")
+        note = str(body.get("note", "")).strip()
+
+        with self.repo.tx() as conn:
+            donor_ids = {g[0] for g in groups}; candidate_ids = {g[1] for g in groups}
+            donors = {row["id"]: row for row in conn.execute(
+                f"SELECT * FROM donors WHERE id IN ({','.join('?' * len(donor_ids))})", tuple(donor_ids))}
+            candidates = {row["id"]: row for row in conn.execute(
+                f"SELECT * FROM candidates WHERE id IN ({','.join('?' * len(candidate_ids))})", tuple(candidate_ids))}
+
+            try:
+                legs = validate_legs(groups, donors, candidates, now=utcnow(), deadline=deadline)
+            except ChainValidationError as exc:
+                raise ApiError(409, "chain_validation_failed", "配对链校验未通过，未建立待确认链", exc.errors) from exc
+
+            # 全部对得上：建立待确认链，先锁器官，防止等待确认期间被单笔分配拿走
+            now = iso()
+            chain_id = self.chains.insert_chain(conn, group_count=len(groups), deadline=iso(deadline),
+                                                note=note, created_by=actor, created_at=now)
+            for leg in legs:
+                self.chains.insert_leg(conn, chain_id=chain_id, position=leg["position"], donor_id=leg["donor_id"],
+                                       candidate_id=leg["candidate_id"], from_hospital=leg["from_hospital"],
+                                       to_hospital=leg["to_hospital"])
+                conn.execute("UPDATE donors SET status='locked',revision=revision+1 WHERE id=? AND status='available'",
+                             (leg["donor_id"],))
+            Repository.audit(conn, None, None, actor, role, "chain_created",
+                             {"group_count": len(groups), "deadline": iso(deadline),
+                              "legs": [{"position": l["position"], "donor_id": l["donor_id"],
+                                        "candidate_id": l["candidate_id"],
+                                        "from_hospital": l["from_hospital"], "to_hospital": l["to_hospital"]}
+                                       for l in legs]}, chain_id)
+            return self._chain_view(conn, self._load_chain(conn, chain_id), role, "")
+
+    def _sweep_timeouts(self, conn: sqlite3.Connection, chain: sqlite3.Row) -> sqlite3.Row:
+        """惰性超时清扫：待确认链超过截止时间，未确认环节按超时断开。"""
+        if chain["status"] != "pending" or parse_time(chain["deadline"]) > utcnow():
+            return chain
+        legs = self.chains.legs_tx(conn, chain["id"])
+        pending = next((leg for leg in legs if leg["position"] == min(
+            l["position"] for l in legs if l["status"] == "pending")), None)
+        return self._break_chain(conn, chain, pending, cause="timed_out", actor="system", role="system", reason="超过约定确认截止时间")
+
+    def _break_chain(self, conn: sqlite3.Connection, chain: sqlite3.Row, failure_leg: sqlite3.Row | None,
+                     *, cause: str, actor: str, role: str, reason: str) -> sqlite3.Row:
+        """断链：该环节留存（拒绝/超时，器官 held），其余未过期器官恢复可选。"""
+        legs = self.chains.legs_tx(conn, chain["id"])
+        now = iso()
+        if failure_leg is not None:
+            status = "rejected" if cause == "rejected" else "timed_out"
+            self.chains.update_leg(conn, failure_leg["id"], status=status, responded_by=actor,
+                                   responded_at=now, reason=reason)
+            # 该环节留下：器官不回池，标记 held 等协调员后续处理
+            conn.execute("UPDATE donors SET status='held',revision=revision+1 WHERE id=?",
+                         (failure_leg["donor_id"],))
+            Repository.audit(conn, None, failure_leg["donor_id"], actor, role,
+                             "chain_leg_rejected" if cause == "rejected" else "chain_leg_timed_out",
+                             {"position": failure_leg["position"], "reason": reason, "organ_held": True},
+                             chain["id"])
+        released, held_expired = [], []
+        failure_id = failure_leg["id"] if failure_leg is not None else -1
+        for leg in legs:
+            if leg["id"] == failure_id:
+                continue
+            # 其余环节（无论此前是否已逐组确认）都未真正落地 allocation：未过期恢复可选
+            donor = conn.execute("SELECT * FROM donors WHERE id=?", (leg["donor_id"],)).fetchone()
+            if parse_time(donor["expires_at"]) > utcnow():
+                conn.execute("UPDATE donors SET status='available',revision=revision+1 WHERE id=?",
+                             (leg["donor_id"],))
+                released.append(leg["donor_id"])
+            else:
+                conn.execute("UPDATE donors SET status='expired',revision=revision+1 WHERE id=?",
+                             (leg["donor_id"],))
+                held_expired.append(leg["donor_id"])
+                Repository.audit(conn, None, leg["donor_id"], "system", "system", "organ_expired",
+                                 {"chain_position": leg["position"], "reason": "chain_broken_after_expiry"},
+                                 chain["id"])
+        failure_reason = f"{cause}: {reason}"
+        self.chains.mark_chain_broken(conn, chain["id"],
+                                      failure_leg=failure_leg["position"] if failure_leg is not None else None,
+                                      failure_reason=failure_reason, broken_at=now)
+        Repository.audit(conn, None, None, actor, role, "chain_broken",
+                         {"cause": cause, "reason": reason,
+                          "failure_leg": failure_leg["position"] if failure_leg is not None else None,
+                          "donors_released": released, "donors_expired": held_expired, "donors_held":
+                              [failure_leg["donor_id"]] if failure_leg is not None else []},
+                         chain["id"])
+        return self.chains.get_chain_tx(conn, chain["id"])
+
+    def respond_leg(self, chain_id: int, position: int, actor: str, role: str, hospital: str,
+                    body: dict[str, Any], *, approve: bool) -> dict[str, Any]:
+        if role != "hospital": raise ApiError(403, "hospital_required", "只有接收医院可以确认配对环节")
+        reason = str(body.get("reason", "")).strip()
+        if not approve and not reason: raise ApiError(400, "reason_required", "拒绝必须填写原因")
+        with self.repo.tx() as conn:
+            chain = self._sweep_timeouts(conn, self._load_chain(conn, chain_id))
+            if chain["status"] != "pending":
+                raise ApiError(409, "chain_closed", f"配对链已结束（{chain['status']}），不能再确认")
+            leg = self.chains.pending_leg_by_position(conn, chain_id, position)
+            if not leg: raise ApiError(404, "leg_not_found", "该环节不存在或已经处理")
+            if leg["to_hospital"] != hospital: raise ApiError(403, "wrong_hospital", "只能由该环节的接收医院回应")
+
+            if not approve:
+                chain = self._break_chain(conn, chain, leg, cause="rejected", actor=actor, role=role, reason=reason)
+                return self._chain_view(conn, chain, role, hospital)
+
+            self.chains.update_leg(conn, leg["id"], status="confirmed", responded_by=actor, responded_at=iso())
+            Repository.audit(conn, None, leg["donor_id"], actor, role, "chain_leg_confirmed",
+                             {"position": position, "hospital": hospital}, chain_id)
+
+            remaining = [row for row in self.chains.legs_tx(conn, chain_id) if row["status"] == "pending"]
+            if remaining:
+                return self._chain_view(conn, chain, role, hospital)
+
+            # 全部环节在截止时间前确认：整链落地为既有单笔 allocation（accepted），进入转运流程
+            return self._finalize_chain(conn, chain, actor, role, hospital)
+
+    def _finalize_chain(self, conn: sqlite3.Connection, chain: sqlite3.Row, actor: str, role: str,
+                        hospital: str) -> dict[str, Any]:
+        now = iso(); allocation_ids = []
+        legs = self.chains.legs_tx(conn, chain["id"])
+        for leg in legs:
+            donor = conn.execute("SELECT * FROM donors WHERE id=?", (leg["donor_id"],)).fetchone()
+            candidate = conn.execute("SELECT * FROM candidates WHERE id=?", (leg["candidate_id"],)).fetchone()
+            score = self._score(donor, candidate)
+            cur = conn.execute(
+                """INSERT INTO allocations(donor_id,candidate_id,score,status,accepted_at,created_by,created_at,updated_at)
+                   VALUES(?,?,?, 'accepted', ?,?,?,?)""",
+                (donor["id"], candidate["id"], score["total"], now, f"chain:{chain['id']}", now, now))
+            allocation_id = cur.lastrowid; allocation_ids.append(allocation_id)
+            conn.execute("UPDATE donors SET status='allocated',revision=revision+1 WHERE id=?", (donor["id"],))
+            self.chains.update_leg(conn, leg["id"], allocation_id=allocation_id)
+            # 每组 chain_leg_confirmed 已在 respond_leg 逐组记录；这里只补每笔 allocation 的落地痕迹，不重复
+            Repository.audit(conn, allocation_id, donor["id"], actor, role, "allocation_proposed",
+                             {"candidate_id": candidate["id"], "score": score, "source": "exchange_chain"}, chain["id"])
+        self.chains.mark_chain_confirmed(conn, chain["id"])
+        Repository.audit(conn, None, None, actor, role, "chain_confirmed",
+                         {"allocation_ids": allocation_ids}, chain["id"])
+        return self._chain_view(conn, self.chains.get_chain_tx(conn, chain["id"]), role, hospital)
+
+    def release_held_donor(self, donor_id: int, actor: str, role: str, body: dict[str, Any]) -> dict[str, Any]:
+        """协调员处置断链留存环节：把 held 器官重新放回可选池（过期则转 expired）。"""
+        if role != "coordinator": raise ApiError(403, "chain_forbidden", "只有协调员可以释放留存环节的器官")
+        reason = str(body.get("reason", "")).strip()
+        if not reason: raise ApiError(400, "reason_required", "释放原因必填（用于审计追溯）")
+        with self.repo.tx() as conn:
+            donor = conn.execute("SELECT * FROM donors WHERE id=?", (donor_id,)).fetchone()
+            if not donor: raise ApiError(404, "donor_not_found", "器官不存在")
+            if donor["status"] != "held": raise ApiError(409, "donor_not_held", "该器官不处于断链留存状态")
+            leg = conn.execute("SELECT * FROM exchange_legs WHERE donor_id=? AND status IN ('rejected','timed_out') ORDER BY id DESC LIMIT 1",
+                               (donor_id,)).fetchone()
+            chain_id = leg["chain_id"] if leg else None
+            if parse_time(donor["expires_at"]) <= utcnow():
+                new_status = "expired"
+            else:
+                new_status = "available"
+            conn.execute("UPDATE donors SET status=?,revision=revision+1 WHERE id=?", (new_status, donor_id))
+            Repository.audit(conn, None, donor_id, actor, role, "held_donor_released",
+                             {"new_status": new_status, "reason": reason, "chain_position": leg["position"] if leg else None},
+                             chain_id)
+            return dict(conn.execute("SELECT * FROM donors WHERE id=?", (donor_id,)).fetchone())
+
+    def get_chain(self, chain_id: int, role: str, hospital: str) -> dict[str, Any]:
+        with self.repo.tx() as conn:
+            chain = self._sweep_timeouts(conn, self._load_chain(conn, chain_id))
+            return self._chain_view(conn, chain, role, hospital)
+
+    def list_chains(self, role: str, hospital: str, status: str | None = None) -> dict[str, Any]:
+        with self.repo.tx() as conn:
+            # 读侧统一过一遍超时，保证协调台看到的状态已结算
+            for row in self.chains.pending_chains_past_deadline(conn, iso()):
+                self._sweep_timeouts(conn, row)
+            chains = []
+            for row in self.chains.list_chains(status=status, hospital=hospital if role == "hospital" else None):
+                chains.append(self._chain_view(conn, row, role, hospital))
+            return {"chains": chains, "server_time": iso()}
+
+    def chain_audit(self, chain_id: int, role: str, hospital: str) -> dict[str, Any]:
+        if role == "viewer": raise ApiError(403, "audit_forbidden", "当前角色不能查看审计记录")
+        with self.repo.tx() as conn:
+            chain = self._load_chain(conn, chain_id)
+            if role == "hospital":
+                related = {r["from_hospital"] for r in self.chains.legs_tx(conn, chain_id)} | \
+                          {r["to_hospital"] for r in self.chains.legs_tx(conn, chain_id)}
+                if hospital not in related: raise ApiError(403, "audit_forbidden", "医院只能查看本机构参与的配对链审计")
+            rows = conn.execute(
+                "SELECT actor,role,action,detail_json,created_at,donor_id,allocation_id FROM audit_log WHERE chain_id=? ORDER BY id",
+                (chain_id,))
+            return {"chain_id": chain_id, "status": chain["status"],
+                    "audit": [dict(r) for r in rows]}
+
     def get_allocation(self, allocation_id: int, role: str, hospital: str) -> dict[str, Any]:
         return self._allocation(self.repo.conn, allocation_id, role, hospital)
 
@@ -336,7 +574,7 @@ class Handler(BaseHTTPRequestHandler):
         except json.JSONDecodeError as exc: raise ApiError(400, "invalid_json", "请求体不是有效 JSON") from exc
         if not isinstance(body, dict): raise ApiError(400, "invalid_json", "请求体必须是对象")
         return body
-    def dispatch_get(self, path: str) -> tuple[int, Any]:
+    def dispatch_get(self, path: str, query: dict[str, list[str]]) -> tuple[int, Any]:
         if path == "/health": return 200, {"status": "ok", "service": "organ-allocation"}
         actor, role, hospital = self.service.identity(self.headers)
         if path == "/api/state": return 200, self.service.state(role, hospital)
@@ -344,6 +582,13 @@ class Handler(BaseHTTPRequestHandler):
         if len(parts) == 4 and parts[:2] == ["api", "donors"] and parts[2].isdigit() and parts[3] == "ranking": return 200, self.service.ranking(int(parts[2]), role, hospital)
         if len(parts) == 3 and parts[:2] == ["api", "allocations"] and parts[2].isdigit(): return 200, self.service.get_allocation(int(parts[2]), role, hospital)
         if len(parts) == 4 and parts[:2] == ["api", "allocations"] and parts[2].isdigit() and parts[3] == "audit": return 200, {"audit": self.service.audit(int(parts[2]), role)}
+        if path == "/api/chains":
+            status = query.get("status", [None])[0]
+            return 200, self.service.list_chains(role, hospital, status)
+        if len(parts) == 3 and parts[:2] == ["api", "chains"] and parts[2].isdigit():
+            return 200, self.service.get_chain(int(parts[2]), role, hospital)
+        if len(parts) == 4 and parts[:2] == ["api", "chains"] and parts[2].isdigit() and parts[3] == "audit":
+            return 200, self.service.chain_audit(int(parts[2]), role, hospital)
         raise ApiError(404, "not_found", "接口不存在")
     def dispatch_post(self, path: str) -> tuple[int, Any]:
         actor, role, hospital = self.service.identity(self.headers); body = self.read_body(); parts = [p for p in path.split("/") if p]
@@ -351,8 +596,20 @@ class Handler(BaseHTTPRequestHandler):
             "/api/donors": lambda: (201, self.service.register_donor(actor, role, body)),
             "/api/candidates": lambda: (201, self.service.register_candidate(actor, role, body)),
             "/api/allocations": lambda: (201, self.service.propose(actor, role, body)),
+            "/api/chains": lambda: (201, self.service.create_chain(actor, role, body)),
         }
         if path in actions: return actions[path]()
+        # 配对链：接收医院逐组确认 / 拒绝
+        if len(parts) == 5 and parts[:2] == ["api", "chains"] and parts[2].isdigit() and parts[3] == "legs" and parts[4].isdigit():
+            cid, position = int(parts[2]), int(parts[4])
+            return 200, self.service.respond_leg(cid, position, actor, role, hospital, body, approve=True)
+        if len(parts) == 6 and parts[:2] == ["api", "chains"] and parts[2].isdigit() and parts[3] == "legs" and parts[4].isdigit():
+            cid, position, action = int(parts[2]), int(parts[4]), parts[5]
+            if action == "reject":
+                return 200, self.service.respond_leg(cid, position, actor, role, hospital, body, approve=False)
+        # 断链留存器官：协调员释放回可选池
+        if len(parts) == 4 and parts[:2] == ["api", "donors"] and parts[2].isdigit() and parts[3] == "release-held":
+            return 200, self.service.release_held_donor(int(parts[2]), actor, role, body)
         if len(parts) == 4 and parts[:2] == ["api", "allocations"] and parts[2].isdigit():
             aid, action = int(parts[2]), parts[3]
             routes = {
@@ -371,9 +628,9 @@ class Handler(BaseHTTPRequestHandler):
         try:
             if method == "GET" and parsed.path == "/":
                 raw = (self.web_root / "index.html").read_bytes(); self.send_response(200); self.send_header("Content-Type", "text/html; charset=utf-8"); self.send_header("Content-Length", str(len(raw))); self.end_headers(); self.wfile.write(raw); return
-            status, payload = self.dispatch_get(parsed.path) if method == "GET" else self.dispatch_post(parsed.path)
+            status, payload = self.dispatch_get(parsed.path, parse_qs(parsed.query)) if method == "GET" else self.dispatch_post(parsed.path)
             json_reply(self, status, payload)
-        except ApiError as exc: json_reply(self, exc.status, {"error": exc.code, "message": exc.message})
+        except ApiError as exc: json_reply(self, exc.status, {"error": exc.code, "message": exc.message, **({"errors": exc.errors} if exc.errors else {})})
         except Exception as exc: print(f"unhandled error: {exc!r}"); json_reply(self, 500, {"error": "internal_error", "message": str(exc)})
     def do_GET(self) -> None: self.handle_any("GET")
     def do_POST(self) -> None: self.handle_any("POST")
